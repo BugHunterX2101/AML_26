@@ -1,0 +1,18 @@
+# Core pipeline (blocking, features, GBDTs, decision) - these exact versions
+# were used to run the pipeline end-to-end.
+numpy==2.5.1
+pandas==3.0.5
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+anyascii==0.3.3
+joblib==1.6.0
+pyarrow==24.0.0
+
+# Optional cross-encoder stage (disable with --no-cross-encoder).
+# Model: microsoft/mdeberta-v3-base (MIT licence, 278M parameters).
+torch==2.5.1
+transformers==4.46.3
+sentencepiece==0.2.0
+protobuf==5.28.3

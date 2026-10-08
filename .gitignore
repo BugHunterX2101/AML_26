@@ -1,0 +1,9 @@
+﻿# data / run artefacts (never commit the competition dataset or trained work dirs)
+dataset/
+work/
+work_full/
+__pycache__/
+*.pyc
+.DS_Store
+*.pkl
+.venv/
