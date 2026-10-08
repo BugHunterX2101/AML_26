@@ -130,6 +130,196 @@ flowchart TD
 
 The design follows the classic **filter → verify** pattern, but each part is tuned to the failure modes the data actually shows.
 
+### 4.1 Detailed architecture of the final pipeline
+
+The diagrams below follow the code: the step names are the functions in [`pipeline.py`](code/business_entity_resolution/src/ber/pipeline.py) (`train_*` and `predict_*`), and the artefact names are the files written to `work/artifacts/`.
+
+#### A. End-to-end system: train, frozen artefacts, predict
+
+```mermaid
+flowchart LR
+    subgraph DATA["Inputs"]
+        TR[("dataset/train<br/>S1 2.21M, S2 5.03M, S3 5.29M<br/>+ ground truth")]
+        TE[("dataset/test<br/>S1 1.73M, S2 4.89M, S3 5.08M<br/>incl. unseen France")]
+    end
+
+    subgraph TRAIN["TRAIN - training data only"]
+        direction TB
+        T0["train_load<br/>read sources + ground truth"] --> T1["train_normalize<br/>static normalisation +<br/>label-free locality phrases"]
+        T1 --> T2["train_split<br/>hold-out, dense, ranker, fit entities<br/>+ 5 folds grouped by S1"]
+        T2 --> T3["train_aliases<br/>token aliases + noise tokens<br/>from training true pairs"]
+        T3 --> T4["train_finalize<br/>derived views, genericness stats,<br/>locality vocabulary"]
+        T4 --> T5["train_dense<br/>fine-tune MiniLM bi-encoder (GPU),<br/>embed every record"]
+        T5 --> T6["train_blocking<br/>6-view union per country x source,<br/>train pruner, prune every block"]
+        T6 --> T7["train_stage1<br/>~75 features, grouped-OOF LightGBM"]
+        T7 --> T8["train_cross_encoder<br/>mDeBERTa on the uncertain band (GPU)"]
+        T8 --> T9["train_stage2<br/>context features, grouped-OOF LightGBM"]
+        T9 --> T10["train_stage3<br/>context from p2, grouped-OOF LightGBM"]
+        T10 --> T11["train_decision<br/>pick final stage + decision rule on OOF,<br/>score hold-out once"]
+    end
+
+    subgraph ART["Frozen artefacts - work/artifacts"]
+        direction TB
+        F1["config.json, aliases.json"]
+        F2["dense_encoder/"]
+        F3["block_ranker.txt"]
+        F4["stage1_fold0-4.txt"]
+        F5["ce_0/, ce_1/"]
+        F6["stage2_fold0-4.txt<br/>stage3_fold0-4.txt"]
+        F7["meta.json<br/>feature lists, final_stage, decision rule"]
+        F8["metrics.json"]
+    end
+
+    subgraph PRED["PREDICT - test split, frozen artefacts"]
+        direction TB
+        P0["predict_prepare<br/>normalise test with TRAIN aliases,<br/>corpus-computed IDF, DF, locality vocab"] --> P1["predict_dense<br/>embed test records"]
+        P1 --> P2["predict_blocking<br/>6-view union + frozen pruner"]
+        P2 --> P3["predict_stage1<br/>features in 2M-row parts, fold-average p1"]
+        P3 --> P4["predict_cross_encoder<br/>only rows with p1 in the band"]
+        P4 --> P5["predict_stage2<br/>context features, fold-average p2"]
+        P5 --> P6{"meta.final_stage = 3 ?"}
+        P6 -->|yes| P7["predict_stage3<br/>context from p2, fold-average p3"]
+        P6 -->|no| P8["use p2"]
+        P7 --> P9["predict_write<br/>decide per S1: expected-F0.5 top-k,<br/>one-owner exclusivity if chosen"]
+        P8 --> P9
+    end
+
+    OUT1[("output/candidate_pairs.tsv<br/>exact set the matcher scored")]
+    OUT2[("output/matching_results.tsv<br/>scored file")]
+    VAL["utils/validate_submission.py<br/>format + matches subset of candidates"]
+
+    TR --> T0
+    T3 -. writes .-> F1
+    T5 -. writes .-> F2
+    T6 -. writes .-> F3
+    T7 -. writes .-> F4
+    T8 -. writes .-> F5
+    T10 -. writes .-> F6
+    T11 -. writes .-> F7
+    T11 -. writes .-> F8
+    TE --> P0
+    F1 -.-> P0
+    F2 -.-> P1
+    F3 -.-> P2
+    F4 -.-> P3
+    F5 -.-> P4
+    F6 -.-> P5
+    F6 -.-> P7
+    F7 -.-> P6
+    F7 -.-> P9
+    P2 --> OUT1
+    P9 --> OUT2
+    OUT1 --> VAL
+    OUT2 --> VAL
+```
+
+#### B. How the training entities are partitioned (no leakage by construction)
+
+```mermaid
+flowchart TD
+    ALL["All training S1 entities<br/>random permutation, seed 2026"] --> HOLD["Hold-out: 15%<br/>never fitted: aliases, pruner, encoder,<br/>GBDTs, cross-encoder, decision rule"]
+    ALL --> REST["Remaining 85%"]
+    REST --> DENSE["Dense slice: 15% of the remaining<br/>about 12.75% of all<br/>their true pairs train the bi-encoder<br/>and nothing else is fitted on them"]
+    REST --> FIT["Fit entities: about 72% of all<br/>train stage 1, 2, 3 and the cross-encoder<br/>fold = position mod 5"]
+    FIT --> RANK["Ranker entities: last 150,000 of the<br/>non-hold-out, non-dense entities<br/>train the blocking pruner"]
+
+    HOLD --> SCORED["Candidates are generated and scored for EVERY entity<br/>so competition features look like the test set"]
+    DENSE --> SCORED
+    FIT --> SCORED
+    SCORED --> OOFN["Fit entities: out-of-fold predictions<br/>used for stage 2/3 inputs and for tuning the decision"]
+    SCORED --> COMP["Hold-out and dense entities and other competitors:<br/>fold-average predictions from models that never saw them"]
+    OOFN --> HONEST["Hold-out macro F0.5 is measured once,<br/>after the decision rule is frozen"]
+    COMP --> HONEST
+```
+
+#### C. Candidate generation inside one (country, target-source) block
+
+```mermaid
+flowchart TD
+    IN1["S1 records of the block<br/>normalised"] --> V
+    IN2["S2 or S3 records of the block<br/>normalised"] --> V
+
+    subgraph V["Retrieval views - IDF computed on this block"]
+        direction TB
+        V1["1. name tokens + space-free whole name<br/>TF-IDF, DF cap 3000"]
+        V2["2. name char 4-grams<br/>DF cap 4000"]
+        V3["3. name phonetic skeleton<br/>DF cap 3000"]
+        V4["4. address words, numbers, number x word<br/>DF cap 3000"]
+        V5["5. name x address conjunctions<br/>DF cap 400"]
+        V6["6. dense bi-encoder cosine<br/>no DF cap, exact GPU search"]
+    end
+
+    V1 --> FWD
+    V2 --> FWD
+    V3 --> FWD
+    V4 --> FWD
+    V5 --> FWD
+    V6 --> FWD
+    FWD["Forward top-k per S1 entity<br/>sparse views k=15, dense k=30"] --> UNI
+    V1 --> REV
+    V2 --> REV
+    V3 --> REV
+    V4 --> REV
+    V5 --> REV
+    V6 --> REV
+    REV["Reverse top-k per S2/S3 record<br/>sparse views k=5, dense k=10"] --> UNI
+
+    UNI["Union of all retrieved pairs<br/>with a bitmask of which views found each pair"] --> FEAT["Pair features:<br/>6 view cosines + number of sparse lists<br/>+ number of dense lists that found the pair"]
+    FEAT --> RANKER["LightGBM pruner (block_ranker.txt)<br/>trained on the ranker entities' union rows"]
+    RANKER --> KEEP["Keep top 16 per S1 entity and source<br/>PLUS every record's single best S1 entity"]
+    KEEP --> CK["Per-block checkpoint (parquet)<br/>mirrored to S3"]
+    CK --> CP[("candidate_pairs.tsv")]
+```
+
+#### D. Scoring and decision: from candidate pairs to the match list
+
+```mermaid
+flowchart TD
+    C["Candidate pairs<br/>(S1 entity, S2/S3 record)"] --> FE1["Stage-1 features, about 75<br/>name, address, house-number family, locality,<br/>genericness, view cosines, group ranks and gaps"]
+    FE1 --> M1["Stage 1 LightGBM<br/>255 leaves, lr 0.05, 5 folds grouped by S1<br/>output: out-of-fold p1"]
+    M1 --> BAND{"p1 between 0.01 and 0.99 ?"}
+    BAND -->|yes, uncertain| CE["Cross-encoder mDeBERTa-v3-base<br/>name | address, 128 tokens<br/>2-fold by entity, out-of-fold score"]
+    BAND -->|no, confident| NAN["score = missing"]
+
+    M1 --> CTX2
+    CE --> CTX2
+    NAN --> CTX2
+    CTX2["Stage-2 context features<br/>rank, gap, sum, confident count of p1 within S1 and within S1 x source<br/>rank, gap, second-best claimant among all S1 entities claiming the record<br/>sibling-anchor name and address agreement with the top other candidates<br/>cross-encoder score"] --> M2["Stage 2 LightGBM<br/>127 leaves, lr 0.03, same folds<br/>output: p2"]
+
+    M2 --> CTX3["Stage-3 context features<br/>same context recomputed from p2<br/>+ margin over the strongest rival claimant"]
+    CTX3 --> M3["Stage 3 LightGBM<br/>127 leaves, lr 0.03, same folds<br/>output: p3"]
+
+    M2 --> TUNE
+    M3 --> TUNE
+    TUNE["train_decision: tune the rule on OOF for each stage<br/>grid = 12 temperatures expected-F0.5<br/>+ 34 global thresholds, each with or without exclusivity"] --> PICK["Final stage = the one with the best OOF macro F0.5<br/>(stage 2 or stage 3), rule frozen in meta.json"]
+    PICK --> HO["Hold-out scored once with the frozen rule"]
+    PICK --> DEC
+
+    subgraph DEC["Decision at inference - per S1 entity"]
+        direction TB
+        D1["Temperature-calibrate probabilities"] --> D2["Sort candidates by probability, keep top 20"]
+        D2 --> D3["Poisson-binomial DP gives exact E of F0.5 for every prefix k<br/>E for k = 0 equals P(no true match), which protects singletons"]
+        D3 --> D4["k* = argmax E of F0.5"]
+        D4 --> D5["Optional one-owner exclusivity:<br/>each S2/S3 record goes only to its most probable S1"]
+    end
+
+    D5 --> R["matching_results.tsv"]
+    R --> RT["Notebook cell 17.7b: re-tune the rule on training OOF from S3 checkpoints,<br/>overwrite only if it wins on BOTH OOF and hold-out"]
+```
+
+#### E. Resumable execution on a single GPU instance
+
+```mermaid
+flowchart LR
+    S["Notebook cell or CLI step"] --> H{"Stage hash =<br/>data + settings + upstream hashes<br/>file already present?"}
+    H -->|yes| L["Restore from local disk or S3"]
+    H -->|no| W["Compute the unit of work<br/>one blocking block, one 2M-row feature part,<br/>one model fold, one cross-encoder half"]
+    W --> U["Write local file, then upload to<br/>ber_outputs/checkpoints on S3 immediately"]
+    L --> N["Next step"]
+    U --> N
+    N --> K["Crash, kernel restart or new instance:<br/>re-run from the top, continue at the first missing file.<br/>A resumed run is bit-identical to an uninterrupted one"]
+```
+
 ---
 
 ## 5. Stage-by-stage deep dive
